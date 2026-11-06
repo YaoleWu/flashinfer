@@ -96,6 +96,14 @@ def prepare_kimi_k3_attn_res(
 
     Notes
     -----
+    The fused output norm consumes the FP32 mixture, without first rounding it
+    to BF16. To require that intermediate rounding, prepare with
+    ``output_norm_weight=None`` into a BF16 scratch tensor, then call
+    :func:`flashinfer.norm.rmsnorm` with a separate caller-owned output. This
+    composition is available only for registered no-output-norm programs;
+    :func:`generated_program_available` must be queried with
+    ``common_path=False, apply_output_norm=False`` and the actual semantic flags.
+
     Dense token-major calls with ``delta`` and ``output_norm_weight`` and at
     most the snapshot write of block ``num_blocks`` take the generated programs
     of the dense path; every other call takes the one-CTA-per-token bootstrap

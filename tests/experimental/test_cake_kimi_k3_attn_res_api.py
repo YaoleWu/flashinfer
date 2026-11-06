@@ -18,8 +18,8 @@ flashinfer public-API tests of the Cake Kimi-K3 AttnRes package: the
 ``flashinfer.experimental.cake_kimi_k3_attn_res.cake_backend`` that carry the
 experimental marking and accept ``backend="cake"`` only; this module checks that
 identity (the same plan and the same bits as the backend, the caller's ``out``
-returned, the ``backend`` keyword) and leaves the numerical contract to
-``test_cake_kimi_k3_attn_res.py``, which imports only the backend package.
+returned, the ``backend`` keyword) and composition with RMSNorm at a BF16 mixture
+boundary. Backend-only numerics live in ``test_cake_kimi_k3_attn_res.py``.
 """
 
 import pytest
@@ -27,6 +27,7 @@ import torch
 
 import flashinfer.kimi_k3_attn_res as facade
 from flashinfer.experimental.cake_kimi_k3_attn_res import cake_backend as backend
+from flashinfer.norm import rmsnorm
 
 
 def _device() -> torch.device:
@@ -112,3 +113,61 @@ def test_facade_one_shot_call_matches_the_backend(pdl):
     torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
     _assert_same_bits(inputs, mirror)
+
+
+def test_bf16_mixture_then_rmsnorm_in_eager_and_graph():
+    """Compose the existing APIs with an explicit BF16 pre-norm boundary."""
+    device = _device()
+    M, K = 2, 8
+    if not facade.generated_program_available(
+        device, M, K, common_path=False, apply_output_norm=False
+    ):
+        pytest.skip("no-output-norm program not registered for this cell")
+    inputs = _make_inputs(M, K)
+    seed = (
+        torch.arange(backend.HIDDEN_SIZE, device=device)
+        .remainder(31)
+        .sub(15)
+        .bfloat16()
+        .expand(M, -1)
+        .contiguous()
+    )
+    inputs["prefix"].copy_(seed)
+    inputs["delta"].fill_(1.0)
+    inputs["blocks"].zero_()
+    inputs["norm_weight"].fill_(1.0)
+    inputs["qk_weight"].zero_()
+    weight = inputs["output_norm_weight"]
+    weight.fill_(1.0)
+    inputs["output_norm_weight"] = None
+    scratch, out = inputs["out"], torch.empty_like(seed)
+    runner = facade.prepare_kimi_k3_attn_res(**inputs, num_blocks=K)
+
+    def launch():
+        runner.launch()
+        rmsnorm(scratch, weight, eps=1e-5, out=out, enable_pdl=False)
+
+    launch()  # Load both programs before capture.
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for run in (launch, graph.replay):
+        for sign in (1, -1):
+            current = seed * sign
+            inputs["prefix"].copy_(current)
+            scratch.fill_(float("nan"))
+            out.fill_(float("nan"))
+            updated = (current.float() + 1.0).bfloat16()
+            # Uniform scores, eight zero snapshots: the exact mixture is prefix / 9.
+            expected_mix = (updated.double() / (K + 1)).bfloat16()
+            rounded = expected_mix.double()
+            expected = (
+                rounded * torch.rsqrt(rounded.square().mean(-1, keepdim=True) + 1e-5)
+            ).bfloat16()
+            run()
+            torch.cuda.synchronize()
+            assert torch.equal(scratch, expected_mix)
+            torch.testing.assert_close(out, expected, rtol=1 / 128, atol=1 / 64)
+            assert torch.equal(inputs["prefix"], updated)
+            assert torch.count_nonzero(inputs["blocks"]) == 0

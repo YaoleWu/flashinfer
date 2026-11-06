@@ -3680,6 +3680,52 @@ def _make_inputs(
     )
 
 
+@pytest.mark.parametrize("M,K", [(1, 1), (64, 8), (1024, 1)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_opposing_bf16_candidates_remain_finite_in_eager_and_graph(M, K, pdl):
+    """Normalize the formed mixture even when candidate rows nearly cancel."""
+    # Adapted from SGLang's test_kimi_k3_attnres_stability.py at 1b9493001ba7
+    # (Apache-2.0). An expanded quadratic norm lost positivity on this input.
+    device, _ = _device_arch()
+    if not cb.generated_program_available(device, M, K, enable_pdl=pdl):
+        pytest.skip("program not registered for this cell")
+    inputs = _make_inputs(M, K)
+    inputs["delta"].zero_()
+    inputs["blocks"].zero_()
+    inputs["blocks"][:, 0, :].fill_(140.0)
+    inputs["norm_weight"].fill_(1.0)
+    inputs["qk_weight"].zero_()  # Every candidate has probability 1 / (K + 1).
+    inputs["output_norm_weight"].fill_(1.0)
+    bank_before = inputs["blocks"].clone()
+    runner = prepare_kimi_k3_attn_res(
+        **inputs, enable_pdl=pdl, eps=1e-5, output_norm_eps=1e-5
+    )
+    runner.launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.launch()
+
+    for launch in (runner.launch, graph.replay):
+        for first_value in (-142.0, -144.0):
+            inputs["prefix"].fill_(-140.0)
+            inputs["prefix"][:, 0] = first_value
+            prefix_before = inputs["prefix"].clone()
+            inputs["out"].fill_(float("nan"))
+            # Independent FP64 oracle: only column zero of the mixture is nonzero.
+            mixed = torch.zeros((M, HIDDEN_SIZE), device=device, dtype=torch.float64)
+            mixed[:, 0] = (140.0 + first_value) / (K + 1)
+            expected = (
+                mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + 1e-5)
+            ).bfloat16()
+            launch()
+            torch.cuda.synchronize()
+            assert torch.isfinite(inputs["out"]).all()
+            torch.testing.assert_close(inputs["out"], expected, rtol=RTOL, atol=ATOL)
+            assert torch.equal(inputs["prefix"], prefix_before)
+            assert torch.equal(inputs["blocks"], bank_before)
+
+
 def _clone(inputs):
     return {k: (v.clone() if torch.is_tensor(v) else v) for k, v in inputs.items()}
 
